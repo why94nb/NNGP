@@ -1,0 +1,167 @@
+daily <-list()
+for (i in 1:365){
+daily[[i]] <- dat[dat$t == i,c(1,3,4,31)]
+if (dim(daily[[i]])[1] > 700){
+  quilt.plot(daily[[i]][,2], daily[[i]][,3] ,daily[[i]][,1])
+  print (i)
+}
+}
+dat3 <- daily[[3]]
+quilt.plot(dat3[,2], dat3[,3] ,dat3[,1])
+
+n <- dim(dat3)[1]
+ho <- sample(1:n, n/5)
+y.ho <- dat3$PM[ho]
+coords.ho <- as.matrix(dat3[ho,c(2,3)])
+X.ho <- as.matrix(dat3[ho,4])
+y <- dat3$PM[-ho]
+coords <- as.matrix(dat3[-ho,c(2,3)])
+X <- as.matrix(dat3[-ho,4])
+
+#gpgp, used to make kriging predictions as input to neural nets 
+fit <- fit_model(y, coords, X, "matern_isotropic")
+y_pred <- predictions(fit$covparms, covfun_name = "matern_isotropic", y, coords,
+                      coords.ho, X, X.ho, fit$beta, reorder = TRUE)
+yinput <- predictions(fit$covparms, covfun_name = "matern_isotropic", y, coords,
+                      coords, X, X, fit$beta, reorder = TRUE)
+mse1 <- mean((y.ho - y_pred)^2) #this should be close to NNGP
+
+
+
+input <- cbind(yinput,coords,X) 
+input_pre <- cbind(y_pred,coords.ho, X.ho) 
+
+
+model <- keras_model_sequential()
+model %>% 
+  layer_dense(units = 200, activation = 'relu', input_shape = c(dim(input)[2])) %>% 
+  layer_dropout(rate = 0.1) %>% 
+  # #layer_batch_normalization() %>%
+  layer_dense(units = 12, activation = 'relu') %>%
+  # layer_dropout(rate = 0.5) %>%
+  #layer_dense(units = 12, activation = 'tanh') %>%
+  # #layer_dense(units = 6, activation = 'tanh') %>%
+  # #layer_dropout(rate = 0.1) %>%
+  # #layer_batch_normalization() %>%
+  layer_dense(units = 1)
+
+#summary(model)
+
+model %>% compile(
+  loss = 'mean_squared_error',
+  optimizer = optimizer_adam(lr = 0.0005),
+  metrics = c('mse')
+)
+
+# Fit model to data
+history <- model %>% fit(
+  input, y,
+  batch_size = 8,
+  epochs = 200,
+  verbose = 0,
+  validation_data = list(input_pre, y.ho)
+)
+
+plot(history)
+
+score <- model %>% evaluate(
+  input_pre, y.ho,
+  verbose = 0
+)
+
+
+
+nngp <- function(y,y.ho,coords,coords.ho,n.samples = 1000,m=10){
+  #return prediction mse, predictions on both training dataset and testing dataset, and No. of neighbors
+  starting <- list("phi"=10, "sigma.sq"=5, "tau.sq"=1)
+  tuning <- list("phi"=0.5, "sigma.sq"=0.5, "tau.sq"=0.5)
+  priors <- list("phi.Unif"=c(3/1, 3/0.01), "sigma.sq.IG"=c(1, 5), "tau.sq.IG"=c(2, 1))
+  cov.model <- "exponential"
+  n.report <- n.samples * 0.8
+  
+  m.r <- spNNGP(y~1, coords=coords, starting=starting, method="response", n.neighbors=m,
+                tuning=tuning, priors=priors, cov.model=cov.model,return.neighbors = T,
+                n.samples=n.samples, n.omp.threads=2, n.report=n.report,verbose = F)
+  ##Prediction for holdout data
+  p.r <- spPredict(m.r, X.0 = matrix(1,length(y.ho),1), coords.0 = coords.ho, n.omp.threads=2,verbose = F)
+  plot(apply(p.r$p.y.0, 1, mean), y.ho)
+  points(apply(p.r$p.y.0, 1, mean), y.ho, pch=19, col="blue")
+  
+  mse <- mean((y.ho - apply(p.r$p.y.0, 1, mean))^2)
+  pp <- NA
+  pp <- spPredict(m.r, X.0 = matrix(1,length(y),1) , coords.0 = coords, n.omp.threads=2, verbose = F)
+  list("mse" = mse, "prediction" = p.r, "m" = m, "train"=pp, "neighbor" = m.r)
+}
+
+nn <- nngp(y,y.ho,coords,coords.ho,n.samples = 2000,m=10)
+m = 5
+pp <- nn$train
+p.r <- nn$prediction
+nn <- nngp(y,y.ho,coords,coords.ho,phi,sigma.sq,tau.sq,n.samples = 2000,m=10)
+m = 10
+pp <- nn$train
+p.r <- nn$prediction
+#neighbor info
+neibinfo <- nn$neighbor
+ord <- neibinfo$ord
+y.ord <- neibinfo$y.ord
+coord.ord <- neibinfo$coords.ord
+ind1 <- neibinfo$n.indx
+
+knnx <- get.knnx(coord.ord,coords.ho, k = m)
+ind2 <- knnx$nn.index
+
+yinput <- matrix(0,dim(coords)[1]-m,m)
+coordinput <- matrix(0,dim(coords)[1]-m,2*m)
+for (i in 1:(dim(coords)[1]-m)){
+  yinput[i,] <- y.ord[ind1[[i+m]]]
+  coordinput[i,] <- as.vector(t(coord.ord[ind1[[i+m]],]))
+}
+
+yinput_pre <- matrix(0,dim(coords.ho)[1],m)
+coordinput_pre <- matrix(0,dim(coords.ho)[1],m*2)
+for (i in 1:dim(coords.ho)[1]){
+  yinput_pre[i,] <- y[ind2[i,]]
+  coordinput_pre[i,] <- as.vector(t(coords[ind2[i,],]))
+}
+#kriging+nonparametric
+
+input <- cbind(yinput,coordinput,y_train[ord][(m+1):dim(coords)[1]],
+                coord.ord[(m+1):dim(coords)[1],])
+input_pre <- cbind(yinput_pre,coordinput_pre,y_pred,coords.ho)
+
+model <- keras_model_sequential()
+model %>% 
+  layer_dense(units = 100, activation = 'relu', input_shape = c(dim(input)[2])) %>% 
+  layer_dropout(rate = 0.5) %>% 
+  layer_dense(units = 100, activation = 'tanh') %>%
+  layer_dropout(rate = 0.5) %>%
+  # layer_dense(units = 20, activation = 'tanh') %>%
+  # layer_dropout(rate = 0.5) %>%
+  layer_dense(units = 1)
+
+summary(model)
+
+model %>% compile(
+  loss = 'mean_squared_error',
+  optimizer = optimizer_adam(lr = 0.001),
+  metrics = c('mse')
+)
+
+# Training & Evaluation ----------------------------------------------------
+
+# Fit model to data
+history <- model %>% fit(
+  input, y,
+  batch_size = 8,
+  epochs = 200,
+  verbose = 0,
+  validation_split = 0.2
+)
+
+plot(history)
+
+score <- model %>% evaluate(
+  input_pre, y.ho,
+  verbose = 0
+)
